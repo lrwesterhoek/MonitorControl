@@ -78,6 +78,12 @@ enum PrefKey: String {
   // Use fine OSD scale for volume
   case useFineScaleVolume
 
+  // OSD position on screen (Tahoe)
+  case osdPosition
+
+  // Enable custom Tahoe OSD (macOS 26+)
+  case enableTahoeOSD
+
   // Use smoothBrightness
   case disableSmoothBrightness
 
@@ -198,6 +204,13 @@ enum MenuItemStyle: Int {
   case icon = 0
   case text = 1
   case hide = 2
+}
+
+enum OSDPosition: Int {
+  case left = 0
+  case right = 1
+  case top = 2
+  case bottom = 3
 }
 
 enum KeyboardBrightness: Int {

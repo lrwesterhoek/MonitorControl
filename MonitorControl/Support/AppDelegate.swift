@@ -52,14 +52,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationDidFinishLaunching(_: Notification) {
     app = self
-    OSDUtils.debugLog("App launched")
     self.subscribeEventListeners()
     self.showSafeModeAlertIfNeeded()
     if !prefs.bool(forKey: PrefKey.appAlreadyLaunched.rawValue) {
-      OSDUtils.debugLog("First launch — showing onboarding")
       self.showOnboardingWindow()
     } else {
-      OSDUtils.debugLog("Not first launch — checking permissions (non-blocking)")
       DispatchQueue.main.async {
         self.checkPermissions()
       }
@@ -68,15 +65,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     self.setDefaultPrefs()
     self.setMenu()
     CGDisplayRegisterReconfigurationCallback({ _, _, _ in app.displayReconfigured() }, nil)
-    OSDUtils.debugLog("Starting configure (firstrun)")
     self.configure(firstrun: true)
-    OSDUtils.debugLog("Displays found: \(DisplayManager.shared.displays.count)")
-    for d in DisplayManager.shared.displays {
-      OSDUtils.debugLog("  Display: \(d.name) id=\(d.identifier) builtin=\(d.isBuiltIn()) virtual=\(d.isVirtual)")
-    }
     DisplayManager.shared.createGammaActivityEnforcer()
     self.updaterController.startUpdater()
-    OSDUtils.debugLog("App launch complete. MediaKeyTap active.")
   }
 
   @objc func quitClicked(_: AnyObject) {
@@ -123,6 +114,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       // Only settings that are not false, 0 or "" by default are set here. Assumes pre-wiped database.
       prefs.set(true, forKey: PrefKey.appAlreadyLaunched.rawValue)
       prefs.set(true, forKey: PrefKey.SUEnableAutomaticChecks.rawValue)
+      if isTahoe() {
+        prefs.set(true, forKey: PrefKey.enableTahoeOSD.rawValue)
+      }
+    }
+    // Ensure Tahoe OSD defaults to enabled on upgrade
+    if isTahoe(), prefs.object(forKey: PrefKey.enableTahoeOSD.rawValue) == nil {
+      prefs.set(true, forKey: PrefKey.enableTahoeOSD.rawValue)
     }
   }
 
@@ -131,6 +129,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     CGDisplayRestoreColorSyncSettings()
     self.reconfigureID += 1
     self.updateMediaKeyTap()
+    if isTahoe(), #available(macOS 11.0, *) {
+      TahoeOSDWindow.cleanUpDisconnectedDisplays()
+    }
     os_log("Bumping reconfigureID to %{public}@", type: .info, String(self.reconfigureID))
     _ = DisplayManager.shared.destroyAllShades()
     if self.sleepID == 0 {

@@ -34,6 +34,8 @@ class KeyboardPrefsViewController: NSViewController, SettingsPane {
   @IBOutlet var useFineScale: NSButton!
   @IBOutlet var useFineScaleVolume: NSButton!
   @IBOutlet var separateCombinedScale: NSButton!
+  var osdPositionPopUp: NSPopUpButton?
+  var enableTahoeOSDCheckbox: NSButton?
 
   @IBOutlet var rowKeyboardBrightnessPopUp: NSGridRow!
   @IBOutlet var rowKeyboardBrightnessText: NSGridRow!
@@ -142,7 +144,88 @@ class KeyboardPrefsViewController: NSViewController, SettingsPane {
     self.customMute.addSubview(customMuteRecorder)
 
     self.populateSettings()
+
+    if isTahoe(), #available(macOS 11.0, *) {
+      self.setupOsdPositionUI()
+    }
   }
+
+  @available(macOS 11.0, *)
+  private func setupOsdPositionUI() {
+    guard let gridView = self.findGridView(in: self.view) else { return }
+
+    // Separator line
+    let separator = NSBox()
+    separator.boxType = .separator
+    let separatorRow = gridView.addRow(with: [separator])
+    separatorRow.mergeCells(in: NSRange(location: 0, length: 2))
+    separatorRow.bottomPadding = -10
+
+    // Enable custom OSD checkbox row
+    let enableLabel = NSTextField(labelWithString: NSLocalizedString("Custom OSD:", comment: "Shown in the keyboard prefs"))
+    enableLabel.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+    enableLabel.alignment = .right
+
+    let enableCheckbox = NSButton(checkboxWithTitle: NSLocalizedString("Enable custom Tahoe OSD", comment: "Shown in the keyboard prefs"), target: self, action: #selector(enableTahoeOSDChanged(_:)))
+    enableCheckbox.state = prefs.bool(forKey: PrefKey.enableTahoeOSD.rawValue) ? .on : .off
+    self.enableTahoeOSDCheckbox = enableCheckbox
+
+    let enableRow = gridView.addRow(with: [enableLabel, enableCheckbox])
+    enableRow.bottomPadding = -13
+    enableRow.cell(at: 0).xPlacement = .trailing
+    enableRow.cell(at: 0).yPlacement = .center
+    enableRow.cell(at: 1).xPlacement = .leading
+
+    // OSD position row: label + popup
+    let posLabel = NSTextField(labelWithString: NSLocalizedString("OSD position:", comment: "Shown in the keyboard prefs"))
+    posLabel.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+    posLabel.alignment = .right
+
+    let popUp = NSPopUpButton()
+    popUp.addItem(withTitle: NSLocalizedString("Left", comment: "OSD position option"))
+    popUp.lastItem?.tag = OSDPosition.left.rawValue
+    popUp.addItem(withTitle: NSLocalizedString("Right", comment: "OSD position option"))
+    popUp.lastItem?.tag = OSDPosition.right.rawValue
+    popUp.addItem(withTitle: NSLocalizedString("Top", comment: "OSD position option"))
+    popUp.lastItem?.tag = OSDPosition.top.rawValue
+    popUp.addItem(withTitle: NSLocalizedString("Bottom", comment: "OSD position option"))
+    popUp.lastItem?.tag = OSDPosition.bottom.rawValue
+    popUp.selectItem(withTag: prefs.integer(forKey: PrefKey.osdPosition.rawValue))
+    popUp.target = self
+    popUp.action = #selector(osdPositionChanged(_:))
+    popUp.isEnabled = enableCheckbox.state == .on
+    self.osdPositionPopUp = popUp
+
+    let posRow = gridView.addRow(with: [posLabel, popUp])
+    posRow.bottomPadding = -13
+    posRow.cell(at: 0).xPlacement = .trailing
+    posRow.cell(at: 0).yPlacement = .center
+    posRow.cell(at: 1).xPlacement = .leading
+  }
+
+  private func findGridView(in view: NSView) -> NSGridView? {
+    if let grid = view as? NSGridView {
+      return grid
+    }
+    for subview in view.subviews {
+      if let grid = findGridView(in: subview) {
+        return grid
+      }
+    }
+    return nil
+  }
+
+  @objc func osdPositionChanged(_ sender: NSPopUpButton) {
+    prefs.set(sender.selectedTag(), forKey: PrefKey.osdPosition.rawValue)
+  }
+
+  @objc func enableTahoeOSDChanged(_ sender: NSButton) {
+    let enabled = sender.state == .on
+    prefs.set(enabled, forKey: PrefKey.enableTahoeOSD.rawValue)
+    self.osdPositionPopUp?.isEnabled = enabled
+    app.updateMediaKeyTap()
+  }
+
 
   func populateSettings() {
     self.keyboardBrightness.selectItem(withTag: prefs.integer(forKey: PrefKey.keyboardBrightness.rawValue))

@@ -52,20 +52,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationDidFinishLaunching(_: Notification) {
     app = self
+    OSDUtils.debugLog("App launched")
     self.subscribeEventListeners()
     self.showSafeModeAlertIfNeeded()
     if !prefs.bool(forKey: PrefKey.appAlreadyLaunched.rawValue) {
+      OSDUtils.debugLog("First launch — showing onboarding")
       self.showOnboardingWindow()
     } else {
-      self.checkPermissions()
+      OSDUtils.debugLog("Not first launch — checking permissions (non-blocking)")
+      DispatchQueue.main.async {
+        self.checkPermissions()
+      }
     }
     self.setPrefsBuildNumber()
     self.setDefaultPrefs()
     self.setMenu()
     CGDisplayRegisterReconfigurationCallback({ _, _, _ in app.displayReconfigured() }, nil)
+    OSDUtils.debugLog("Starting configure (firstrun)")
     self.configure(firstrun: true)
+    OSDUtils.debugLog("Displays found: \(DisplayManager.shared.displays.count)")
+    for d in DisplayManager.shared.displays {
+      OSDUtils.debugLog("  Display: \(d.name) id=\(d.identifier) builtin=\(d.isBuiltIn()) virtual=\(d.isVirtual)")
+    }
     DisplayManager.shared.createGammaActivityEnforcer()
     self.updaterController.startUpdater()
+    OSDUtils.debugLog("App launch complete. MediaKeyTap active.")
   }
 
   @objc func quitClicked(_: AnyObject) {

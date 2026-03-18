@@ -21,7 +21,26 @@ class OSDUtils: NSObject {
     return osdImage
   }
 
+  static func debugLog(_ msg: String) {
+    let entry = "\(Date()): \(msg)\n"
+    let path = "/tmp/monitorcontrol_osd_debug.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+      handle.seekToEndOfFile()
+      handle.write(entry.data(using: .utf8)!)
+      handle.closeFile()
+    } else {
+      FileManager.default.createFile(atPath: path, contents: entry.data(using: .utf8))
+    }
+  }
+
   static func showOsd(displayID: CGDirectDisplayID, command: Command, value: Float, maxValue: Float = 1, roundChiclet: Bool = false, lock: Bool = false) {
+    debugLog("showOsd called: display=\(displayID) cmd=\(command) value=\(value) maxValue=\(maxValue)")
+    if !DEBUG_MACOS10, #available(macOS 16.0, *) {
+      debugLog("Taking Tahoe path")
+      TahoeOSDWindow.showOsd(displayID: displayID, command: command, value: value, maxValue: maxValue)
+      return
+    }
+    debugLog("Taking legacy OSDManager path")
     guard let manager = OSDManager.sharedManager() as? OSDManager else {
       return
     }
@@ -40,6 +59,10 @@ class OSDUtils: NSObject {
   }
 
   static func showOsdVolumeDisabled(displayID: CGDirectDisplayID) {
+    if !DEBUG_MACOS10, #available(macOS 16.0, *) {
+      TahoeOSDWindow.showOsdDisabled(displayID: displayID, iconName: "speaker.slash.fill")
+      return
+    }
     guard let manager = OSDManager.sharedManager() as? OSDManager else {
       return
     }
@@ -47,6 +70,10 @@ class OSDUtils: NSObject {
   }
 
   static func showOsdMuteDisabled(displayID: CGDirectDisplayID) {
+    if !DEBUG_MACOS10, #available(macOS 16.0, *) {
+      TahoeOSDWindow.showOsdDisabled(displayID: displayID, iconName: "speaker.slash.fill")
+      return
+    }
     guard let manager = OSDManager.sharedManager() as? OSDManager else {
       return
     }
@@ -54,6 +81,10 @@ class OSDUtils: NSObject {
   }
 
   static func popEmptyOsd(displayID: CGDirectDisplayID, command: Command) {
+    if !DEBUG_MACOS10, #available(macOS 16.0, *) {
+      TahoeOSDWindow.popEmpty(displayID: displayID, command: command)
+      return
+    }
     guard let manager = OSDManager.sharedManager() as? OSDManager else {
       return
     }

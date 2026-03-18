@@ -147,12 +147,16 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
 
   func updateMediaKeyTap() {
     var keys: [MediaKey] = []
-    if [KeyboardBrightness.media.rawValue, KeyboardBrightness.both.rawValue].contains(prefs.integer(forKey: PrefKey.keyboardBrightness.rawValue)) {
+    let brightnessPref = prefs.integer(forKey: PrefKey.keyboardBrightness.rawValue)
+    let volumePref = prefs.integer(forKey: PrefKey.keyboardVolume.rawValue)
+    OSDUtils.debugLog("updateMediaKeyTap: brightnessPref=\(brightnessPref) volumePref=\(volumePref)")
+    if [KeyboardBrightness.media.rawValue, KeyboardBrightness.both.rawValue].contains(brightnessPref) {
       keys.append(contentsOf: [.brightnessUp, .brightnessDown])
     }
-    if [KeyboardVolume.media.rawValue, KeyboardVolume.both.rawValue].contains(prefs.integer(forKey: PrefKey.keyboardVolume.rawValue)) {
+    if [KeyboardVolume.media.rawValue, KeyboardVolume.both.rawValue].contains(volumePref) {
       keys.append(contentsOf: [.mute, .volumeUp, .volumeDown])
     }
+    OSDUtils.debugLog("updateMediaKeyTap: keys after prefs=\(keys)")
     // Remove brightness keys if no external displays are connected, but only if brightness fine control is not active
     var disengageBrightness = true
     for display in DisplayManager.shared.getAllDisplays() where !display.isBuiltIn() {
@@ -177,11 +181,15 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
         keys.removeAll { keysToDelete.contains($0) }
       }
     }
+    OSDUtils.debugLog("updateMediaKeyTap: keys after filtering=\(keys)")
     self.mediaKeyTap?.stop()
     // returning an empty array listens for all mediakeys in MediaKeyTap
     if keys.count > 0 {
+      OSDUtils.debugLog("updateMediaKeyTap: STARTING tap for \(keys.count) keys")
       self.mediaKeyTap = MediaKeyTap(delegate: self, on: KeyPressMode.keyDownAndUp, for: keys, observeBuiltIn: true)
       self.mediaKeyTap?.start()
+    } else {
+      OSDUtils.debugLog("updateMediaKeyTap: NO keys to tap — media key interception DISABLED")
     }
   }
 

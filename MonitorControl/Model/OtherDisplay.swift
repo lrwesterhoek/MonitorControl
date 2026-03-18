@@ -310,7 +310,10 @@ class OtherDisplay: Display {
     if !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue), prefs.bool(forKey: PrefKey.separateCombinedScale.rawValue) {
       osdValue = self.calcNewValue(currentValue: currentValue, isUp: isUp, isSmallIncrement: isSmallIncrement, half: true)
       _ = self.setBrightness(osdValue)
-      if osdValue > self.combinedBrightnessSwitchingValue() {
+      if !DEBUG_MACOS10, #available(macOS 16.0, *) {
+        // Tahoe: show full range (0=black, 1=max brightness)
+        OSDUtils.showOsd(displayID: self.identifier, command: .brightness, value: osdValue, roundChiclet: !isSmallIncrement)
+      } else if osdValue > self.combinedBrightnessSwitchingValue() {
         OSDUtils.showOsd(displayID: self.identifier, command: .brightness, value: osdValue - self.combinedBrightnessSwitchingValue(), maxValue: self.combinedBrightnessSwitchingValue(), roundChiclet: !isSmallIncrement)
       } else {
         self.doSwAfterOsdAnimation()

@@ -6,7 +6,7 @@ import os.log
 /// Custom OSD window matching the macOS Tahoe (26+) pill-shaped volume/brightness indicator.
 /// Supports vertical (left/right) and horizontal (top/bottom) orientations.
 /// Interactive: click or drag to set brightness/volume directly.
-/// Replaces the private OSDManager API which no longer renders correctly on macOS 26.
+/// Uses NSGlassEffectView + NSGlassEffectContainerView on macOS 26+ for native Liquid Glass.
 @available(macOS 11.0, *)
 class TahoeOSDWindow {
 
@@ -36,31 +36,38 @@ class TahoeOSDWindow {
   private static var windows: [CGDirectDisplayID: TahoeOSDWindow] = [:]
 
   /// Remove cached OSD windows for displays that are no longer connected.
-  /// Call this from `displayReconfigured()` in AppDelegate.
   static func cleanUpDisconnectedDisplays() {
     let connectedIDs = Set(NSScreen.screens.compactMap { $0.displayID })
     for displayID in windows.keys where !connectedIDs.contains(displayID) {
       windows[displayID]?.panel.orderOut(nil)
       windows.removeValue(forKey: displayID)
-      os_log("TahoeOSD: cleaned up stale window for display %{public}@", type: .info, String(displayID))
     }
   }
 
-  // MARK: - Fill View — uses draw(_:) for maximum reliability
+  // MARK: - Fill View (legacy fallback only)
 
   private class FillView: NSView {
-    var fillColor = NSColor.white.withAlphaComponent(0.8)
+    var fillColor = NSColor.white.withAlphaComponent(0.55)
+    override var isOpaque: Bool { false }
     override func draw(_ dirtyRect: NSRect) {
       fillColor.setFill()
       bounds.fill()
     }
   }
 
-  // MARK: - Interactive Hit View — handles mouse events over the entire pill
+  // MARK: - Panel subclass — must be key-capable for cursor rects to work
+
+  private class OSDPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+  }
+
+  // MARK: - Interactive Hit View — handles mouse events + cursor
 
   private class InteractiveView: NSView {
     weak var osdWindow: TahoeOSDWindow?
     private var trackingArea: NSTrackingArea?
+    private var cursorPushed = false
 
     override func updateTrackingAreas() {
       super.updateTrackingAreas()
@@ -69,7 +76,7 @@ class TahoeOSDWindow {
       }
       let area = NSTrackingArea(
         rect: bounds,
-        options: [.mouseEnteredAndExited, .activeAlways, .cursorUpdate],
+        options: [.mouseEnteredAndExited, .activeAlways],
         owner: self,
         userInfo: nil
       )
@@ -77,13 +84,26 @@ class TahoeOSDWindow {
       trackingArea = area
     }
 
-    override func cursorUpdate(with event: NSEvent) {
-      NSCursor.pointingHand.set()
+    override func mouseEntered(with event: NSEvent) {
+      if !cursorPushed {
+        NSCursor.pointingHand.push()
+        cursorPushed = true
+      }
+      // Keep OSD visible while hovered
+      osdWindow?.handleMouseEntered()
     }
 
-    override func resetCursorRects() {
-      addCursorRect(bounds, cursor: .pointingHand)
+    override func mouseExited(with event: NSEvent) {
+      if cursorPushed {
+        NSCursor.pop()
+        cursorPushed = false
+      }
+      // Resume dismiss countdown after mouse leaves
+      osdWindow?.handleMouseExited()
     }
+
+    // Accept the very first click without requiring the window to be key first
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
       osdWindow?.handleMouseEvent(event)
@@ -96,14 +116,17 @@ class TahoeOSDWindow {
     override func mouseUp(with event: NSEvent) {
       osdWindow?.handleMouseUp()
     }
+
+    deinit {
+      if cursorPushed {
+        NSCursor.pop()
+      }
+    }
   }
 
   // MARK: - Instance Properties
 
-  private let panel: NSPanel
-  private let containerView: NSView
-  private let effectView: NSVisualEffectView
-  private let fillView: FillView
+  private let panel: OSDPanel
   private let iconView: NSImageView
   private let interactiveView: InteractiveView
   private let displayID: CGDirectDisplayID
@@ -111,20 +134,27 @@ class TahoeOSDWindow {
   private var isHorizontal: Bool = false
   private var currentCommand: Command = .brightness
   private var isDragging: Bool = false
+  private var isHovered: Bool = false
   private var lastDDCWriteTime: TimeInterval = 0
   private var pendingDDCValue: Float?
   private var ddcThrottleTimer: Timer?
+
+  // Fill indicator (used on both Tahoe and legacy)
+  private var fillView: FillView?
+
+  // Legacy fallback (pre-26)
+  private var effectView: NSVisualEffectView?
 
   // MARK: - Public Interface
 
   static func showOsd(displayID: CGDirectDisplayID, command: Command, value: Float, maxValue: Float = 1) {
     let normalizedValue = maxValue > 0 ? min(max(value / maxValue, 0), 1) : 0
-    let iconName = self.iconName(for: command, value: normalizedValue)
+    let icon = self.iconInfo(for: command, value: normalizedValue)
     let work = {
       let osd = self.getOrCreate(for: displayID)
       osd.currentCommand = command
       osd.applyOrientation()
-      osd.update(iconName: iconName, value: normalizedValue)
+      osd.update(iconName: icon.name, variableValue: icon.variableValue, value: normalizedValue)
       osd.present()
     }
     if Thread.isMainThread { work() } else { DispatchQueue.main.async { work() } }
@@ -134,7 +164,7 @@ class TahoeOSDWindow {
     let work = {
       let osd = self.getOrCreate(for: displayID)
       osd.applyOrientation()
-      osd.update(iconName: iconName, value: 0)
+      osd.update(iconName: iconName, variableValue: nil, value: 0)
       osd.present()
     }
     if Thread.isMainThread { work() } else { DispatchQueue.main.async { work() } }
@@ -143,10 +173,10 @@ class TahoeOSDWindow {
   static func popEmpty(displayID: CGDirectDisplayID, command: Command) {
     let work = {
       let osd = self.getOrCreate(for: displayID)
-      let iconName = self.iconName(for: command, value: 0)
+      let icon = self.iconInfo(for: command, value: 0)
       osd.currentCommand = command
       osd.applyOrientation()
-      osd.update(iconName: iconName, value: 0)
+      osd.update(iconName: icon.name, variableValue: icon.variableValue, value: 0)
       osd.present(autoDismissDelay: 0)
     }
     if Thread.isMainThread { work() } else { DispatchQueue.main.async { work() } }
@@ -154,19 +184,20 @@ class TahoeOSDWindow {
 
   // MARK: - Icon Selection
 
-  private static func iconName(for command: Command, value: Float) -> String {
+  /// Returns (symbolName, variableValue) for the given command and level.
+  /// Volume uses a single symbol with variable value so the speaker body never changes size.
+  private static func iconInfo(for command: Command, value: Float) -> (name: String, variableValue: Double?) {
     switch command {
     case .audioSpeakerVolume:
-      if value <= 0 { return "speaker.slash.fill" }
-      else if value < 0.33 { return "speaker.wave.1.fill" }
-      else if value < 0.66 { return "speaker.wave.2.fill" }
-      else { return "speaker.wave.3.fill" }
+      // Always use speaker.wave.3.fill with variable value so the icon frame never changes.
+      // variableValue 0 = all waves dimmed (muted look), 1 = all waves lit.
+      return ("speaker.wave.3.fill", Double(max(0, value)))
     case .audioMuteScreenBlank:
-      return "speaker.slash.fill"
+      return ("speaker.wave.3.fill", 0)
     case .contrast:
-      return "circle.lefthalf.fill"
+      return ("circle.lefthalf.fill", nil)
     default:
-      return "sun.max.fill"
+      return ("sun.max.fill", nil)
     }
   }
 
@@ -198,10 +229,19 @@ class TahoeOSDWindow {
 
     let w = pillWidth
     let h = pillHeight
+    let pillFrame = NSRect(x: 0, y: 0, width: w, height: h)
 
-    containerView.frame = NSRect(x: 0, y: 0, width: w, height: h)
-    effectView.frame = NSRect(x: 0, y: 0, width: w, height: h)
-    interactiveView.frame = NSRect(x: 0, y: 0, width: w, height: h)
+    // Resize the root (panel.contentView) and all children
+    panel.contentView?.frame = pillFrame
+    for subview in panel.contentView?.subviews ?? [] {
+      // Resize glass, effect, and interactive views to full pill
+      // (fill view is resized separately in update())
+      if subview !== fillView {
+        subview.frame = pillFrame
+      }
+    }
+    effectView?.frame = pillFrame
+    interactiveView.frame = pillFrame
 
     if isHorizontal {
       iconView.frame = NSRect(
@@ -228,10 +268,11 @@ class TahoeOSDWindow {
 
     let w: CGFloat = isHorizontal ? Self.pillLong : Self.pillShort
     let h: CGFloat = isHorizontal ? Self.pillShort : Self.pillLong
+    let pillFrame = NSRect(x: 0, y: 0, width: w, height: h)
 
-    // Panel: borderless, transparent, always-on-top
-    panel = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+    // Panel
+    panel = OSDPanel(
+      contentRect: pillFrame,
       styleMask: [.borderless, .nonactivatingPanel],
       backing: .buffered,
       defer: false
@@ -242,69 +283,177 @@ class TahoeOSDWindow {
     panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
     panel.ignoresMouseEvents = false
     panel.acceptsMouseMovedEvents = true
+    panel.becomesKeyOnlyIfNeeded = true
     panel.hasShadow = true
     panel.animationBehavior = .none
     panel.alphaValue = 0
     panel.isReleasedWhenClosed = false
 
-    // Container: clips all children to pill shape via layer mask
-    containerView = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
-    containerView.wantsLayer = true
-    containerView.layer?.cornerRadius = Self.cornerRadius
-    containerView.layer?.masksToBounds = true
-    containerView.layer?.cornerCurve = .continuous
-    panel.contentView = containerView
-
-    // Background blur: dark translucent HUD material (fills entire container)
-    effectView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
-    effectView.material = .hudWindow
-    effectView.blendingMode = .behindWindow
-    effectView.state = .active
-    effectView.appearance = NSAppearance(named: .darkAqua)
-    containerView.addSubview(effectView)
-
-    // Fill: bar that grows from bottom (vertical) or left (horizontal)
-    fillView = FillView(frame: NSRect(x: 0, y: 0, width: isHorizontal ? 0 : w, height: isHorizontal ? h : 0))
-    containerView.addSubview(fillView)
-
-    // Icon: SF Symbol
+    // Icon
     let iconFrame: NSRect
     if isHorizontal {
-      iconFrame = NSRect(
-        x: Self.iconEdgePadding,
-        y: (h - Self.iconSize) / 2,
-        width: Self.iconSize,
-        height: Self.iconSize
-      )
+      iconFrame = NSRect(x: Self.iconEdgePadding, y: (h - Self.iconSize) / 2, width: Self.iconSize, height: Self.iconSize)
     } else {
-      iconFrame = NSRect(
-        x: (w - Self.iconSize) / 2,
-        y: Self.iconEdgePadding,
-        width: Self.iconSize,
-        height: Self.iconSize
-      )
+      iconFrame = NSRect(x: (w - Self.iconSize) / 2, y: Self.iconEdgePadding, width: Self.iconSize, height: Self.iconSize)
     }
     iconView = NSImageView(frame: iconFrame)
     iconView.imageScaling = .scaleProportionallyUpOrDown
     iconView.contentTintColor = .white
-    containerView.addSubview(iconView)
 
-    // Interactive overlay: transparent view on top that captures mouse events
-    interactiveView = InteractiveView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+    // Interactive overlay
+    interactiveView = InteractiveView(frame: pillFrame)
     interactiveView.osdWindow = self
-    containerView.addSubview(interactiveView)
+
+    // Build view hierarchy depending on macOS version
+    if #available(macOS 26.0, *) {
+      setupTahoeGlass(pillFrame: pillFrame)
+    } else {
+      setupLegacyVisualEffect(pillFrame: pillFrame)
+    }
+  }
+
+  // MARK: - Tahoe Glass Setup (macOS 26+)
+
+  @available(macOS 26.0, *)
+  private func setupTahoeGlass(pillFrame: NSRect) {
+    let w = pillFrame.width
+    let h = pillFrame.height
+
+    // Glass background: clear style for a lighter, more transparent glass
+    let glass = NSGlassEffectView()
+    glass.frame = pillFrame
+    glass.cornerRadius = Self.cornerRadius
+    glass.style = .clear
+
+    // Fill indicator: placed inside the glass contentView so it renders
+    // through the glass refraction — no separate clip container needed
+    let glassContent = NSView(frame: pillFrame)
+    let fill = FillView(frame: NSRect(x: 0, y: 0, width: isHorizontal ? 0 : w, height: isHorizontal ? h : 0))
+    fill.fillColor = NSColor.white.withAlphaComponent(0.12)
+    self.fillView = fill
+    glassContent.addSubview(fill)
+    glass.contentView = glassContent
+
+    // Root: glass (contains fill inside), icon + interactive on top
+    let root = NSView(frame: pillFrame)
+    root.wantsLayer = true
+    root.addSubview(glass)
+    root.addSubview(iconView)
+    root.addSubview(interactiveView)
+    panel.contentView = root
+
+    // Reduce the backdrop blur intensity applied by NSGlassEffectView.
+    // The glass view uses CALayer backdrop filters internally; walk the
+    // layer tree after layout to find CIGaussianBlur and lower its radius.
+    DispatchQueue.main.async {
+      Self.reduceBlur(in: glass)
+    }
+  }
+
+  // MARK: - Legacy Visual Effect Setup (pre-26)
+
+  private func setupLegacyVisualEffect(pillFrame: NSRect) {
+    let w = pillFrame.width
+    let h = pillFrame.height
+
+    let container = NSView(frame: pillFrame)
+    container.wantsLayer = true
+    container.layer?.cornerRadius = Self.cornerRadius
+    container.layer?.masksToBounds = true
+    container.layer?.cornerCurve = .continuous
+
+    let effect = NSVisualEffectView(frame: pillFrame)
+    effect.material = .hudWindow
+    effect.blendingMode = .behindWindow
+    effect.state = .active
+    self.effectView = effect
+    container.addSubview(effect)
+
+    let fill = FillView(frame: NSRect(x: 0, y: 0, width: isHorizontal ? 0 : w, height: isHorizontal ? h : 0))
+    self.fillView = fill
+    container.addSubview(fill)
+
+    container.addSubview(iconView)
+    container.addSubview(interactiveView)
+
+    panel.contentView = container
+  }
+
+  // MARK: - Blur Reduction
+
+  /// Walk a view's layer tree to find backdrop CIGaussianBlur filters and reduce their radius.
+  /// NSGlassEffectView doesn't expose blur controls, so we patch the CALayer filters directly.
+  private static func reduceBlur(in view: NSView) {
+    guard let layer = view.layer else { return }
+    Self.reduceBlurInLayer(layer)
+  }
+
+  private static func reduceBlurInLayer(_ layer: CALayer) {
+    // Check backgroundFilters (backdrop filters used for behind-window blur)
+    if let filters = layer.backgroundFilters as? [NSObject] {
+      for filter in filters {
+        // CAFilter wraps CIFilter; its name matches the CIFilter name
+        if filter.responds(to: Selector(("name"))),
+           let name = filter.value(forKey: "name") as? String,
+           name.lowercased().contains("blur") || name.contains("gaussianBlur") {
+          // Reduce blur radius — default is often ~20–40; bring it down significantly
+          if filter.responds(to: Selector(("setValue:forKey:"))) {
+            filter.setValue(1.5, forKey: "inputRadius")
+          }
+        }
+      }
+    }
+
+    // Also check regular filters
+    if let filters = layer.filters as? [NSObject] {
+      for filter in filters {
+        if filter.responds(to: Selector(("name"))),
+           let name = filter.value(forKey: "name") as? String,
+           name.lowercased().contains("blur") || name.contains("gaussianBlur") {
+          if filter.responds(to: Selector(("setValue:forKey:"))) {
+            filter.setValue(1.5, forKey: "inputRadius")
+          }
+        }
+      }
+    }
+
+    // Recurse into sublayers
+    for sublayer in layer.sublayers ?? [] {
+      Self.reduceBlurInLayer(sublayer)
+    }
   }
 
   // MARK: - Mouse Interaction
 
+  fileprivate func handleMouseEntered() {
+    isHovered = true
+    // Stop any pending dismiss — keep OSD fully visible while hovered
+    dismissTimer?.invalidate()
+    dismissTimer = nil
+    // Snap to full opacity if mid-fade
+    NSAnimationContext.runAnimationGroup { ctx in
+      ctx.duration = 0.1
+      panel.animator().alphaValue = 1
+    }
+  }
+
+  fileprivate func handleMouseExited() {
+    isHovered = false
+    // Resume dismiss countdown if not dragging
+    if !isDragging {
+      dismissTimer?.invalidate()
+      dismissTimer = Timer.scheduledTimer(withTimeInterval: Self.interactiveDismissDelay, repeats: false) { [weak self] _ in
+        self?.dismiss()
+      }
+    }
+  }
+
   fileprivate func handleMouseEvent(_ event: NSEvent) {
     isDragging = true
 
-    // Pause auto-dismiss while dragging
     dismissTimer?.invalidate()
     dismissTimer = nil
 
-    // Convert click position to normalized 0-1 value
     let localPoint = interactiveView.convert(event.locationInWindow, from: nil)
     let normalizedValue: Float
 
@@ -314,18 +463,14 @@ class TahoeOSDWindow {
       normalizedValue = Float(max(0, min(1, localPoint.y / pillHeight)))
     }
 
-    // Update OSD visuals immediately
-    let iconName = Self.iconName(for: currentCommand, value: normalizedValue)
-    update(iconName: iconName, value: normalizedValue)
-
-    // Apply value to the display (throttled)
+    let icon = Self.iconInfo(for: currentCommand, value: normalizedValue)
+    update(iconName: icon.name, variableValue: icon.variableValue, value: normalizedValue)
     applyValueThrottled(normalizedValue)
   }
 
   fileprivate func handleMouseUp() {
     isDragging = false
 
-    // Flush any pending throttled value
     if let pending = pendingDDCValue {
       ddcThrottleTimer?.invalidate()
       ddcThrottleTimer = nil
@@ -333,10 +478,12 @@ class TahoeOSDWindow {
       applyValueToDisplay(pending)
     }
 
-    // Restart dismiss timer after interaction ends
-    dismissTimer?.invalidate()
-    dismissTimer = Timer.scheduledTimer(withTimeInterval: Self.interactiveDismissDelay, repeats: false) { [weak self] _ in
-      self?.dismiss()
+    // Only start dismiss if mouse has already left the pill
+    if !isHovered {
+      dismissTimer?.invalidate()
+      dismissTimer = Timer.scheduledTimer(withTimeInterval: Self.interactiveDismissDelay, repeats: false) { [weak self] _ in
+        self?.dismiss()
+      }
     }
   }
 
@@ -347,14 +494,12 @@ class TahoeOSDWindow {
     let elapsed = now - lastDDCWriteTime
 
     if elapsed >= Self.ddcWriteInterval {
-      // Enough time has passed — write immediately
       lastDDCWriteTime = now
       pendingDDCValue = nil
       ddcThrottleTimer?.invalidate()
       ddcThrottleTimer = nil
       applyValueToDisplay(value)
     } else {
-      // Too soon — schedule a deferred write
       pendingDDCValue = value
       if ddcThrottleTimer == nil {
         let remaining = Self.ddcWriteInterval - elapsed
@@ -401,13 +546,22 @@ class TahoeOSDWindow {
 
   // MARK: - Update
 
-  private func update(iconName: String, value: Float) {
+  private func update(iconName: String, variableValue: Double?, value: Float) {
     let v = max(0, min(1, value))
 
-    // Update icon
-    iconView.image = NSImage(systemSymbolName: iconName, accessibilityDescription: nil)
+    // Use variableValue to animate wave lines while keeping the symbol frame constant.
+    // speaker.wave.3.fill with variableValue 0.3 shows 1 wave highlighted, 0.6 shows 2, etc.
+    let symbolConfig = NSImage.SymbolConfiguration(pointSize: Self.iconSize * 0.75, weight: .medium)
+    let baseImage: NSImage?
+    if let vv = variableValue, #available(macOS 13.0, *) {
+      baseImage = NSImage(systemSymbolName: iconName, variableValue: vv, accessibilityDescription: nil)
+    } else {
+      baseImage = NSImage(systemSymbolName: iconName, accessibilityDescription: nil)
+    }
+    iconView.image = baseImage?.withSymbolConfiguration(symbolConfig)
+    iconView.symbolConfiguration = symbolConfig
 
-    // Calculate fill frame based on orientation
+    // Resize fill bar
     let newFrame: NSRect
     if isHorizontal {
       let fillWidth = CGFloat(v) * pillWidth
@@ -417,32 +571,18 @@ class TahoeOSDWindow {
       newFrame = NSRect(x: 0, y: 0, width: pillWidth, height: fillHeight)
     }
 
-    // Set fill frame (animate if already visible and not dragging, otherwise snap)
     let isVisible = panel.alphaValue > 0.01
     if isVisible && !isDragging {
       NSAnimationContext.runAnimationGroup { ctx in
         ctx.duration = Self.fillAnimationDuration
         ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
         ctx.allowsImplicitAnimation = true
-        fillView.animator().frame = newFrame
+        fillView?.animator().frame = newFrame
       }
     } else {
-      fillView.frame = newFrame
+      fillView?.frame = newFrame
     }
-    fillView.needsDisplay = true
-
-    // Icon tint: dark when over the white fill, white when over the dark background
-    let iconOverFill: Bool
-    if isHorizontal {
-      let iconCenterX = Self.iconEdgePadding + Self.iconSize / 2
-      iconOverFill = newFrame.width > iconCenterX
-    } else {
-      let iconCenterY = Self.iconEdgePadding + Self.iconSize / 2
-      iconOverFill = newFrame.height > iconCenterY
-    }
-    iconView.contentTintColor = iconOverFill
-      ? NSColor(white: 0.1, alpha: 0.9)
-      : NSColor.white.withAlphaComponent(0.9)
+    fillView?.needsDisplay = true
   }
 
   // MARK: - Show / Dismiss
@@ -470,7 +610,7 @@ class TahoeOSDWindow {
   }
 
   private func dismiss() {
-    guard !isDragging else { return }
+    guard !isDragging, !isHovered else { return }
     dismissTimer?.invalidate()
     dismissTimer = nil
     NSAnimationContext.runAnimationGroup({ ctx in
@@ -498,19 +638,14 @@ class TahoeOSDWindow {
     switch position {
     case .left:
       x = visibleFrame.origin.x + Self.screenEdgePadding
-      // Center vertically on the full screen
       y = fullFrame.origin.y + (fullFrame.height - h) / 2
     case .right:
       x = visibleFrame.origin.x + visibleFrame.width - w - Self.screenEdgePadding
-      // Center vertically on the full screen
       y = fullFrame.origin.y + (fullFrame.height - h) / 2
     case .top:
-      // Center horizontally on the full screen (aligns under the notch)
       x = fullFrame.origin.x + (fullFrame.width - w) / 2
-      // Position just below the menu bar
       y = visibleFrame.origin.y + visibleFrame.height - h - Self.screenEdgePadding
     case .bottom:
-      // Center horizontally on the full screen (aligns under the notch)
       x = fullFrame.origin.x + (fullFrame.width - w) / 2
       y = visibleFrame.origin.y + Self.screenEdgePadding
     }
